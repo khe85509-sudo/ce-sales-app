@@ -122,6 +122,60 @@ async function cloudWrite(snapshot){
  setCloudState('synced');
  return true;
 }
+
+let cloudPullBusy=false;
+let cloudSyncTimer=null;
+
+async function pullCloudIfNewer(){
+  if(!supabaseClient || cloudPullBusy || saveInProgress) return false;
+  cloudPullBusy=true;
+  try{
+    const cloud=await cloudRead();
+    if(!cloud || !hasStoredData(cloud)) return false;
+    const localStamp=Number(db?.__savedAt||0);
+    const cloudStamp=Number(cloud?.__savedAt||0);
+    if(cloudStamp>localStamp){
+      db=normalizeDb(cloud);
+      PRODUCT_CATALOG={};
+      Object.entries(db.products||{}).forEach(([k,vs])=>{
+        const key=String(k).trim();
+        if(key&&Array.isArray(vs)) PRODUCT_CATALOG[key]=[...new Set(vs.map(v=>String(v).trim()).filter(Boolean))];
+      });
+      try{await idbWrite(cloud)}catch{}
+      try{lsWrite(cloud)}catch{}
+      try{showHome()}catch{}
+      setCloudState('synced');
+      return true;
+    }
+    if(localStamp>cloudStamp){
+      // Local has a newer change (for example, a change made while offline).
+      // Push it so the other phone can receive it.
+      await cloudWrite(JSON.parse(JSON.stringify({...db,products:PRODUCT_CATALOG,__savedAt:localStamp})));
+      return true;
+    }
+    setCloudState('synced');
+    return false;
+  }catch(e){
+    setCloudState('error');
+    console.warn('Cloud auto-sync failed:',e);
+    return false;
+  }finally{
+    cloudPullBusy=false;
+  }
+}
+
+function startCloudAutoSync(){
+  if(!supabaseClient) return;
+  if(cloudSyncTimer) clearInterval(cloudSyncTimer);
+  // Pull frequently enough for two phones to see each other's changes.
+  cloudSyncTimer=setInterval(pullCloudIfNewer,5000);
+  window.addEventListener('focus',pullCloudIfNewer);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible') pullCloudIfNewer();
+  });
+  pullCloudIfNewer();
+}
+
 async function manualCloudSync(){
  try{await persist(true);alert(`☁️ Cloud Sync အောင်မြင်ပါတယ်။ Customer ${db.customers.length} ယောက်ကို Cloud ထဲသိမ်းပြီးပါပြီ။`)}catch(e){setCloudState('error');alert('☁️ Cloud Sync မအောင်မြင်ပါ။\n\n'+(e?.message||e))}
 }
@@ -840,12 +894,24 @@ init();
 </script>
 
 <script>
-if ('serviceWorker' in navigator) {
+(function () {
+  if (!('serviceWorker' in navigator)) return;
   window.addEventListener('load', function () {
-    navigator.serviceWorker.register('./sw.js').catch(function () {});
+    navigator.serviceWorker.register('./sw.js', {scope: './'})
+      .then(function (registration) {
+        registration.update();
+      })
+      .catch(function (error) {
+        console.error('PWA service worker registration failed:', error);
+      });
   });
-}
+})();
 </script>
 
+<script>
+window.addEventListener('load', function(){
+  setTimeout(function(){ try{ startCloudAutoSync(); }catch(e){ console.warn(e); } }, 1500);
+});
+</script>
 </body>
 </html>
